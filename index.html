@@ -16,6 +16,7 @@
 <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/dexie@3.2.4/dist/dexie.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
 <style>
 /* ===== CSS VARIABLES: satu set warna, otomatis ganti saat dark ===== */
 :root{
@@ -486,6 +487,15 @@ body.dark .pager-btn:hover:not(:disabled){background:#475569;color:#fff}
           </div>
 
           <div class="menu-section">
+            <div class="menu-label">☁️ SINKRON CLOUD</div>
+            <div class="backup-small" id="sbStatus">☁️ Belum tersinkron.</div>
+            <div style="display:flex;flex-direction:column;gap:7px;margin-top:8px">
+              <button type="button" class="backup-action primary" onclick="sbSync()">🔄 Sinkron Sekarang</button>
+              <button type="button" class="backup-action warn" onclick="sbLogout()">🚪 Keluar</button>
+            </div>
+          </div>
+
+          <div class="menu-section">
             <div class="menu-label">💾 MENU BACKUP</div>
             <div class="backup-last" id="backupLastStatus">Backup terakhir: belum ada • Folder Google Drive belum dipilih.</div>
             <div style="display:flex;flex-direction:column;gap:7px">
@@ -777,6 +787,7 @@ body.dark .pager-btn:hover:not(:disabled){background:#475569;color:#fff}
           await db.open();
         }
       } catch(eIdx){ console.warn('Perbaikan indeks gagal', eIdx); try { db.close(); } catch(_){} db = mk(2); try { await db.open(); } catch(e3){ throw e3; } }
+      sbAttachHooks();
       useIDB = true;
     } catch(e){ console.warn('IndexedDB unavailable; falling back to in-memory mode.', e); db = null; useIDB = false; }
   }
@@ -3130,14 +3141,238 @@ self.onmessage = function(e){
     applyTheme(mode);
   }
 
+  /* ===== SB START: Sinkronisasi Supabase (local-first: device tetap jadi penyimpanan utama) ===== */
+  const SB_URL = 'https://nkhrvvltpdkcjwqtuhvz.supabase.co';
+  const SB_KEY = 'sb_publishable_b17wXa33A8Zchb0twocHfw_QTe4HDsa';
+  const SB_DOMAIN = '@gajahmas.app';
+  const SB_META_KEYS = ['batalFaktur', 'batalLine', 'qtyKoreksi', 'customerManual', 'produkHarga'];
+  let sbc = null, sbReady = false, sbSuppress = false, sbBusy = false, sbAgain = false, sbTimer = null, sbPersistTimer = null, sbStarted = false;
+  let sbDirty = new Set(), sbDirtyMeta = new Set();
+  try { sbDirty = new Set(JSON.parse(localStorage.getItem('sb-dirty') || '[]')); sbDirtyMeta = new Set(JSON.parse(localStorage.getItem('sb-dirty-meta') || '[]')); } catch(e){}
+  const sbFk = v => String(v == null ? '' : v).trim();
+  function sbPersistQueue(){ try { localStorage.setItem('sb-dirty', JSON.stringify([...sbDirty])); localStorage.setItem('sb-dirty-meta', JSON.stringify([...sbDirtyMeta])); } catch(e){} }
+  function sbSchedule(){
+    clearTimeout(sbPersistTimer); sbPersistTimer = setTimeout(sbPersistQueue, 300);
+    clearTimeout(sbTimer); sbTimer = setTimeout(() => { sbSync(); }, 1500);
+  }
+  function sbSetStatus(t){ const el = document.getElementById('sbStatus'); if (el) el.textContent = t; }
+  function sbEmail(n){ return String(n || '').trim().toLowerCase().replace(/\s+/g, '') + SB_DOMAIN; }
+
+  /* Hook Dexie: setiap perubahan tabel tx/meta (input faktur, impor, edit, hapus, restore) otomatis masuk antrean kirim. */
+  function sbAttachHooks(){
+    if (!db || !useIDB) return;
+    const mark = o => { if (sbSuppress || !o) return; const f = sbFk(o.faktur); if (f) { sbDirty.add(f); sbSchedule(); } };
+    const markMeta = k => { if (sbSuppress || SB_META_KEYS.indexOf(k) < 0) return; sbDirtyMeta.add(k); sbSchedule(); };
+    db.tx.hook('creating', function(pk, obj){ mark(obj); });
+    db.tx.hook('updating', function(mods, pk, obj){ mark(obj); if (mods && mods.faktur != null) mark({ faktur: mods.faktur }); });
+    db.tx.hook('deleting', function(pk, obj){ mark(obj); });
+    db.meta.hook('creating', function(pk, obj){ markMeta(obj && obj.key); });
+    db.meta.hook('updating', function(mods, pk, obj){ markMeta(pk != null ? pk : (obj && obj.key)); });
+  }
+
+  async function sbPushFakturs(){
+    const batch = [...sbDirty]; if (!batch.length) return 0;
+    const set = new Set(batch), byF = new Map(); batch.forEach(f => byF.set(f, []));
+    sbDirty.clear(); sbPersistQueue();
+    try {
+      await db.tx.filter(r => set.has(sbFk(r.faktur))).each(r => { const o = JSON.parse(JSON.stringify(r)); delete o.id; byF.get(sbFk(r.faktur)).push(o); });
+      const payload = batch.map(f => { const lines = byF.get(f); return { faktur: f, bulan: lines.length ? (lines[0].bulan || '') : null, data: lines, deleted: !lines.length }; });
+      for (let i = 0; i < payload.length; i += 100) {
+        const { error } = await sbc.from('fakturs').upsert(payload.slice(i, i + 100), { onConflict: 'faktur' });
+        if (error) throw error;
+      }
+    } catch(e){ batch.forEach(f => sbDirty.add(f)); sbPersistQueue(); throw e; }
+    return batch.length;
+  }
+  async function sbPushMeta(){
+    const keys = [...sbDirtyMeta]; if (!keys.length) return 0;
+    sbDirtyMeta.clear(); sbPersistQueue();
+    try {
+      for (const k of keys) {
+        const m = await db.meta.get(k); if (!m) continue;
+        const { data, error } = await sbc.from('app_settings').upsert({ key: k, value: m.value }, { onConflict: 'key' }).select('updated_at');
+        if (error) throw error;
+        if (data && data[0]) localStorage.setItem('sb-sts-' + k, data[0].updated_at);
+      }
+    } catch(e){ keys.forEach(k => sbDirtyMeta.add(k)); sbPersistQueue(); throw e; }
+    return keys.length;
+  }
+  function sbRevive(o){
+    ['tanggal', 'Tanggal'].forEach(k => { if (typeof o[k] === 'string') { const d = new Date(o[k]); if (!isNaN(d)) o[k] = d; } });
+    return o;
+  }
+  async function sbApply(items){
+    items = items.filter(it => !sbDirty.has(it.faktur)); if (!items.length) return 0;
+    const set = new Set(items.map(i => i.faktur)), add = [];
+    items.forEach(it => { if (!it.deleted && Array.isArray(it.data)) it.data.forEach(r => add.push(sbRevive(r))); });
+    sbSuppress = true;
+    try {
+      const ids = await db.tx.filter(r => set.has(sbFk(r.faktur))).primaryKeys();
+      if (ids.length) await db.tx.bulkDelete(ids);
+      for (let i = 0; i < add.length; i += 2000) await db.tx.bulkAdd(add.slice(i, i + 2000));
+      if (add.length) {
+        const months = new Set(), sales = new Set(), products = new Set();
+        add.forEach(r => { if (r.bulan) months.add(r.bulan); if (r.sales) sales.add(r.sales); if (r.produk) products.add(r.produk); });
+        const merge = async (key, vals, cmp) => { const cur = ((await db.meta.get(key)) || {}).value || []; const st = new Set(cur); vals.forEach(v => v && st.add(v)); await db.meta.put({ key, value: [...st].sort(cmp) }); };
+        await merge('months', [...months], (a, b) => b.localeCompare(a));
+        await merge('sales', [...sales], (a, b) => a.localeCompare(b, 'id'));
+        await merge('products', [...products], (a, b) => a.localeCompare(b, 'id'));
+      }
+    } finally { sbSuppress = false; }
+    try {
+      items.forEach(it => {
+        if (it.deleted) { _fkRef.fk.delete(it.faktur); _fkRef.fkc.F.delete(it.faktur); _fkRef.fkc.R.delete(it.faktur); }
+        else { _fkRef.fk.add(it.faktur); const l = (it.data || [])[0]; if (l) _fkRef.fkc[isFitriProduct(l.produk) ? 'F' : 'R'].add(it.faktur); }
+      });
+    } catch(e){}
+    return items.length;
+  }
+  /* Tarik faktur baru/berubah dari cloud. full=true: tarik semua (login pertama di perangkat ini). */
+  async function sbPullFakturs(full, remoteSet){
+    const last = full ? null : localStorage.getItem('sb-last-pull');
+    let from = 0, maxTs = last, changed = 0;
+    for (;;) {
+      let q = sbc.from('fakturs').select('faktur,data,deleted,updated_at').order('updated_at', { ascending: true }).order('faktur', { ascending: true }).range(from, from + 499);
+      if (last) q = q.gte('updated_at', last);
+      const { data, error } = await q; if (error) throw error;
+      const page = data || [];
+      page.forEach(it => { if (remoteSet) remoteSet.add(it.faktur); if (!maxTs || Date.parse(it.updated_at) > Date.parse(maxTs)) maxTs = it.updated_at; });
+      changed += await sbApply(page);
+      if (page.length < 500) break; from += 500;
+    }
+    if (maxTs) localStorage.setItem('sb-last-pull', maxTs);
+    return changed;
+  }
+  async function sbPullSettings(){
+    const { data, error } = await sbc.from('app_settings').select('key,value,updated_at'); if (error) throw error;
+    const remoteKeys = new Set(); let changed = 0;
+    for (const r of (data || [])) {
+      if (SB_META_KEYS.indexOf(r.key) < 0) continue;
+      remoteKeys.add(r.key);
+      if (sbDirtyMeta.has(r.key)) continue;
+      const lt = localStorage.getItem('sb-sts-' + r.key);
+      if (!lt || Date.parse(r.updated_at) > Date.parse(lt)) {
+        sbSuppress = true; try { await db.meta.put({ key: r.key, value: r.value }); } finally { sbSuppress = false; }
+        localStorage.setItem('sb-sts-' + r.key, r.updated_at); changed++;
+      }
+    }
+    /* Pengaturan yang ada di perangkat tapi belum ada di cloud: kirim. */
+    for (const k of SB_META_KEYS) {
+      if (remoteKeys.has(k)) continue;
+      const m = await db.meta.get(k);
+      if (m && m.value != null) sbDirtyMeta.add(k);
+    }
+    sbPersistQueue();
+    return changed;
+  }
+  async function sbReloadUI(hadRows){
+    try { await loadBatalFaktur(); } catch(e){}
+    try { await phLoad(); } catch(e){}
+    try { if (!hadRows) await restoreFromDB(); else await refreshAfterDataChange(); } catch(e){ console.warn('sbReloadUI', e); }
+  }
+  async function sbSync(){
+    if (!sbReady || !sbc || !useIDB || !db) return;
+    if (!navigator.onLine) { sbSetStatus('☁️ Offline — data tersimpan di perangkat, akan dikirim saat online.'); return; }
+    if (sbBusy) { sbAgain = true; return; }
+    sbBusy = true; sbSetStatus('☁️ Menyinkronkan…');
+    try {
+      const hadRows = (await db.tx.count()) > 0;
+      let pulled = 0;
+      if (!localStorage.getItem('sb-init-done')) {
+        /* Login pertama di perangkat ini: tarik semua dari cloud, lalu kirim faktur lokal yang belum ada di cloud. */
+        const remoteSet = new Set();
+        pulled += await sbPullFakturs(true, remoteSet);
+        const localF = new Set(); await db.tx.each(r => { const f = sbFk(r.faktur); if (f) localF.add(f); });
+        localF.forEach(f => { if (!remoteSet.has(f)) sbDirty.add(f); });
+        pulled += await sbPullSettings();
+        sbPersistQueue();
+        localStorage.setItem('sb-init-done', '1');
+      }
+      const sent = (await sbPushFakturs()) + (await sbPushMeta());
+      pulled += await sbPullFakturs(false) + await sbPullSettings();
+      await sbPushMeta();
+      if (pulled > 0) await sbReloadUI(hadRows);
+      localStorage.setItem('sb-last-sync', new Date().toISOString());
+      sbSetStatus('☁️ Tersinkron ' + new Date().toLocaleTimeString('id-ID') + (sent ? ' • terkirim ' + sent : '') + (pulled ? ' • diterima ' + pulled : ''));
+    } catch(e){
+      console.warn('sbSync gagal', e);
+      sbSetStatus('☁️ Sinkron tertunda (' + ((e && e.message) || e) + '). Data aman di perangkat, akan dicoba lagi.');
+    } finally { sbBusy = false; if (sbAgain) { sbAgain = false; setTimeout(sbSync, 500); } }
+  }
+  function sbStart(){
+    sbReady = true;
+    if (sbStarted) { sbSync(); return; }
+    sbStarted = true;
+    sbSync();
+    setInterval(() => { if (!document.hidden) sbSync(); }, 60000);
+    window.addEventListener('online', () => sbSync());
+    window.addEventListener('focus', () => sbSync());
+    window.addEventListener('pagehide', sbPersistQueue);
+  }
+  /* ---- Layar login (satu nama + satu password; diperiksa oleh Supabase Auth, bukan oleh kode halaman) ---- */
+  function sbShowLogin(msg){
+    let el = document.getElementById('sbLogin');
+    if (!el) {
+      el = document.createElement('div'); el.id = 'sbLogin';
+      el.style.cssText = 'position:fixed;inset:0;z-index:99999;background:linear-gradient(135deg,#1f4e78,#285894);display:flex;align-items:center;justify-content:center;padding:16px;font-family:inherit';
+      el.innerHTML = '<div style="background:#fff;color:#1b2a3a;border-radius:14px;padding:24px 22px;width:100%;max-width:340px;box-shadow:0 10px 40px rgba(0,0,0,.35)">'
+        + '<div style="font-size:17px;font-weight:800;margin-bottom:4px">Faktur &amp; Rekap Penjualan</div>'
+        + '<div style="font-size:12px;color:#6b7a8c;margin-bottom:16px">Masuk dengan nama dan password</div>'
+        + '<input id="sbName" type="text" autocomplete="username" autocapitalize="none" placeholder="Nama" style="width:100%;box-sizing:border-box;padding:10px;border:1px solid #c9d3df;border-radius:8px;font-size:14px;margin-bottom:10px">'
+        + '<input id="sbPass" type="password" autocomplete="current-password" placeholder="Password" style="width:100%;box-sizing:border-box;padding:10px;border:1px solid #c9d3df;border-radius:8px;font-size:14px;margin-bottom:10px">'
+        + '<div id="sbLoginMsg" style="min-height:16px;font-size:12px;color:#c0392b;margin-bottom:8px"></div>'
+        + '<button id="sbLoginBtn" type="button" style="width:100%;padding:11px;border:0;border-radius:8px;background:#285894;color:#fff;font-weight:800;font-size:14px;cursor:pointer">Masuk</button></div>';
+      document.body.appendChild(el);
+      document.getElementById('sbLoginBtn').onclick = sbDoLogin;
+      el.addEventListener('keydown', e => { if (e.key === 'Enter') sbDoLogin(); });
+    }
+    el.style.display = 'flex';
+    const m = document.getElementById('sbLoginMsg'); if (m) m.textContent = msg || '';
+  }
+  function sbHideLogin(){ const el = document.getElementById('sbLogin'); if (el) el.style.display = 'none'; }
+  async function sbDoLogin(){
+    const n = document.getElementById('sbName').value, p = document.getElementById('sbPass').value, m = document.getElementById('sbLoginMsg'), b = document.getElementById('sbLoginBtn');
+    if (!n.trim() || !p) { m.textContent = 'Isi nama dan password.'; return; }
+    if (!sbc) { m.textContent = 'Butuh koneksi internet untuk login (library belum termuat).'; return; }
+    b.disabled = true; b.textContent = 'Memeriksa…'; m.textContent = '';
+    try {
+      const { error } = await sbc.auth.signInWithPassword({ email: sbEmail(n), password: p });
+      if (error) { m.textContent = /fetch|network/i.test(error.message || '') ? 'Tidak bisa terhubung ke server. Periksa internet.' : 'Nama atau password salah.'; }
+      else { localStorage.setItem('sb-logged-in', '1'); document.getElementById('sbPass').value = ''; sbHideLogin(); sbStart(); }
+    } catch(e){ m.textContent = 'Tidak bisa terhubung ke server. Periksa internet.'; }
+    b.disabled = false; b.textContent = 'Masuk';
+  }
+  async function sbLogout(){
+    if (!confirm('Keluar dari akun? Data di perangkat ini tetap tersimpan.')) return;
+    try { await sbc.auth.signOut(); } catch(e){}
+    localStorage.removeItem('sb-logged-in'); sbReady = false; sbShowLogin('');
+  }
+  async function sbInit(){
+    if (typeof supabase === 'undefined' || !supabase.createClient) {
+      sbSetStatus('☁️ Cloud belum aktif (library tidak termuat / offline).');
+      if (localStorage.getItem('sb-logged-in')) sbHideLogin(); else sbShowLogin('Butuh internet untuk login pertama kali.');
+      return;
+    }
+    sbc = supabase.createClient(SB_URL, SB_KEY, { auth: { persistSession: true, autoRefreshToken: true, storageKey: 'sb-gajahmas-auth' } });
+    let session = null;
+    try { const r = await sbc.auth.getSession(); session = r && r.data && r.data.session; } catch(e){}
+    if (session) { localStorage.setItem('sb-logged-in', '1'); sbHideLogin(); sbStart(); }
+    else if (!navigator.onLine && localStorage.getItem('sb-logged-in')) { sbHideLogin(); sbSetStatus('☁️ Offline — tersinkron setelah online.'); window.addEventListener('online', () => location.reload(), { once: true }); }
+    else { localStorage.removeItem('sb-logged-in'); sbShowLogin(''); }
+    sbc.auth.onAuthStateChange((ev) => { if (ev === 'SIGNED_OUT') { sbReady = false; localStorage.removeItem('sb-logged-in'); sbShowLogin(''); } });
+  }
+  /* ===== SB END ===== */
+
   (async function init(){
     initTheme();
+    if (!localStorage.getItem('sb-logged-in')) sbShowLogin('');
     await initDB();
     /* Minta penyimpanan permanen agar browser tidak menghapus data otomatis saat ruang penuh. */
     try { if (navigator.storage && navigator.storage.persist) { const ok = await navigator.storage.persist(); console.info('Penyimpanan permanen:', ok); } } catch(e){}
     if (!useIDB) { try { alert('PERINGATAN: penyimpanan di perangkat tidak aktif (mungkin mode Incognito/Private). Faktur yang diinput TIDAK akan tersimpan setelah halaman ditutup. Buka di jendela Chrome biasa.'); } catch(e){} }
     await restoreFromDB();
     await loadBackupHandle();
+    sbInit();
     try { await refreshAutoBatalBadgeOnly(); } catch(e){}
     try { fkInGo(); } catch(e){ console.warn('fkInGo awal', e); }
   })();
