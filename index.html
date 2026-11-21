@@ -2324,7 +2324,7 @@ self.onmessage = function(e){
       } else rows = rows.concat(list);
       filters.month = bulan;
       showBusy('Memperbarui…'); await refreshAfterDataChange(); hideBusy();
-      _fkRef.fk.add(no); _fkRef.fkc[isF ? 'F' : 'R'].add(no); fkInReset(); setStatus('Faktur ' + no + ' tersimpan (' + list.length + ' baris).');
+      _fkRef.fk.add(no); _fkRef.fkc[isF ? 'F' : 'R'].add(no); fkInReset(); setStatus('Faktur ' + no + ' tersimpan (' + list.length + ' baris).'); autoBackupAfterSave();
       if (doPrint) cetakFaktur(no);
     } catch (e) { hideBusy(); console.error('fkInSave', e); alert('Gagal menyimpan faktur: ' + (e.message || e)); }
   }
@@ -3012,9 +3012,29 @@ self.onmessage = function(e){
     if(backupDirHandle && backupDirHandle.name) folder=backupDirHandle.name;
     el.textContent='Backup terakhir: '+(last==='belum ada'?'belum ada':new Date(last).toLocaleString('id-ID'))+(name?' • '+name:'')+' • Folder Google Drive '+folder+'.';
   }
+  /* Simpan handle folder di IndexedDB terpisah agar folder tetap diingat setelah aplikasi ditutup. */
+  function _hdb(){ return new Promise((res, rej) => { const r = indexedDB.open('rekapHandles', 1); r.onupgradeneeded = () => r.result.createObjectStore('h'); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }); }
+  async function saveBackupHandle(h){ try { const d = await _hdb(); await new Promise((res, rej) => { const t = d.transaction('h', 'readwrite'); t.objectStore('h').put(h, 'dir'); t.oncomplete = res; t.onerror = () => rej(t.error); }); d.close(); } catch(e){ console.warn('Simpan handle folder gagal', e); } }
+  async function loadBackupHandle(){ try { const d = await _hdb(); const h = await new Promise((res, rej) => { const q = d.transaction('h').objectStore('h').get('dir'); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); }); d.close(); if (h) { backupDirHandle = h; updateBackupPanelStatus(); } } catch(e){} }
+  /* Backup otomatis: tiap faktur tersimpan, tulis ke file harian di folder pilihan (ditimpa, tidak menumpuk). */
+  let _autoBkTimer = null;
+  function autoBackupAfterSave(){ clearTimeout(_autoBkTimer); _autoBkTimer = setTimeout(autoBackupRun, 800); }
+  async function autoBackupRun(){
+    if (!backupDirHandle) return;
+    try {
+      let perm = await backupDirHandle.queryPermission({mode:'readwrite'});
+      if (perm !== 'granted') { try { perm = await backupDirHandle.requestPermission({mode:'readwrite'}); } catch(e){ perm = 'denied'; } }
+      if (perm !== 'granted') { setStatus('Backup otomatis belum jalan: klik "Backup Sekarang ke Google Drive" sekali untuk mengizinkan folder.'); return; }
+      const backup = await buildBackupObject(), d = new Date(), pad = n => String(n).padStart(2, '0');
+      const name = 'AutoBackup_Rekap_' + d.getFullYear() + pad(d.getMonth() + 1) + pad(d.getDate()) + '.json';
+      const fh = await backupDirHandle.getFileHandle(name, {create:true});
+      const w = await fh.createWritable(); await w.write(JSON.stringify(backup)); await w.close();
+      saveBackupLast(name); setStatus('Faktur tersimpan + backup otomatis ke folder "' + backupDirHandle.name + '" (' + name + ').');
+    } catch(e){ console.warn('Backup otomatis gagal', e); setStatus('Backup otomatis gagal: ' + (e.message || e)); }
+  }
   async function chooseBackupFolder(){
     if(!window.showDirectoryPicker){ alert('Browser ini belum mendukung pemilihan folder langsung. Gunakan "Unduh File Backup (manual)" atau Chrome/Edge versi terbaru.'); return; }
-    try{ const h=await window.showDirectoryPicker({mode:'readwrite'}); backupDirHandle=h; try{localStorage.setItem('rekap-backup-folder-name',h.name||'')}catch(e){} await updateBackupPanelStatus(); setStatus('Folder backup dipilih: '+(h.name||'Google Drive')); }
+    try{ const h=await window.showDirectoryPicker({mode:'readwrite'}); backupDirHandle=h; try{localStorage.setItem('rekap-backup-folder-name',h.name||'')}catch(e){} await saveBackupHandle(h); await updateBackupPanelStatus(); setStatus('Folder backup dipilih: '+(h.name||'Google Drive')); }
     catch(e){ if(e && e.name!=='AbortError') alert('Pemilihan folder dibatalkan/gagal: '+(e.message||e)); }
   }
   async function ensureBackupFolder(){
@@ -3113,7 +3133,11 @@ self.onmessage = function(e){
   (async function init(){
     initTheme();
     await initDB();
+    /* Minta penyimpanan permanen agar browser tidak menghapus data otomatis saat ruang penuh. */
+    try { if (navigator.storage && navigator.storage.persist) { const ok = await navigator.storage.persist(); console.info('Penyimpanan permanen:', ok); } } catch(e){}
+    if (!useIDB) { try { alert('PERINGATAN: penyimpanan di perangkat tidak aktif (mungkin mode Incognito/Private). Faktur yang diinput TIDAK akan tersimpan setelah halaman ditutup. Buka di jendela Chrome biasa.'); } catch(e){} }
     await restoreFromDB();
+    await loadBackupHandle();
     try { await refreshAutoBatalBadgeOnly(); } catch(e){}
     try { fkInGo(); } catch(e){ console.warn('fkInGo awal', e); }
   })();
