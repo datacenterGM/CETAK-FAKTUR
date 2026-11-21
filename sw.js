@@ -1,11 +1,11 @@
 /* Service worker: aplikasi bisa dibuka offline setelah pernah dimuat sekali (butuh internet saat pertama kali). */
-const VERSION = 'v1';
+const VERSION = 'v2';
 const CORE = 'faktur-core-' + VERSION, LIBS = 'faktur-libs-' + VERSION;
 const CORE_FILES = ['./', './index.html', './manifest.json', './icons/icon-192.png', './icons/icon-512.png', './icons/favicon-32.png', './icons/apple-touch-icon.png'];
 const LIB_HOSTS = ['cdn.jsdelivr.net', 'cdnjs.cloudflare.com'];
 
 self.addEventListener('install', e => {
-  e.waitUntil(caches.open(CORE).then(c => c.addAll(CORE_FILES)).then(() => self.skipWaiting()));
+  e.waitUntil(caches.open(CORE).then(c => Promise.all(CORE_FILES.map(f => c.add(f).catch(() => null)))).then(() => self.skipWaiting()));
 });
 self.addEventListener('activate', e => {
   e.waitUntil(caches.keys().then(ks => Promise.all(ks.filter(k => k !== CORE && k !== LIBS).map(k => caches.delete(k)))).then(() => self.clients.claim()));
