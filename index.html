@@ -753,14 +753,27 @@ body.dark .pager-btn:hover:not(:disabled){background:#475569;color:#fff}
         db = mk(Math.max(3, Math.ceil(ev / 10)));
         await db.open();
       }
-      /* Pastikan semua indeks ada (database lama bisa kekurangan indeks gabungan); bila kurang, naikkan versi agar Dexie menambahkannya. */
+      /* Pastikan semua indeks BENAR-BENAR ada di database browser (bukan hanya di skema Dexie). */
       try {
         const need = ['bulan','sales','pembayaran','_ts','produk','kdCustomer','[bulan+sales]','[bulan+pembayaran]','[bulan+produk]'];
-        const have = () => db.tx.schema.idxByName || {};
-        if (need.some(n => !have()[n])) {
-          const cur = db.verno || 2;
+        const kp = n => n.charAt(0) === '[' ? n.slice(1, -1).split('+') : n;
+        const real = Array.from(db.backendDB().transaction(['tx'], 'readonly').objectStore('tx').indexNames);
+        const missing = need.filter(n => real.indexOf(n) < 0);
+        if (missing.length) {
+          const nativeV = db.backendDB().version;
           db.close();
-          db = mk(Math.max(3, Math.ceil(cur) + 1));
+          const newNative = (Math.floor(nativeV / 10) + 1) * 10;
+          await new Promise((res, rej) => {
+            const rq = indexedDB.open('rekapPenjualan_v1', newNative);
+            rq.onupgradeneeded = () => {
+              const st = rq.transaction.objectStore('tx');
+              missing.forEach(n => { try { st.createIndex(n, kp(n)); } catch(_){} });
+            };
+            rq.onsuccess = () => { rq.result.close(); res(); };
+            rq.onerror = () => rej(rq.error);
+            rq.onblocked = () => rej(new Error('Database terblokir: tutup tab lain aplikasi ini lalu muat ulang'));
+          });
+          db = mk(newNative / 10);
           await db.open();
         }
       } catch(eIdx){ console.warn('Perbaikan indeks gagal', eIdx); try { db.close(); } catch(_){} db = mk(2); try { await db.open(); } catch(e3){ throw e3; } }
@@ -1144,6 +1157,7 @@ self.onmessage = function(e){
     const filt = (batalFakturSet.size || batalLineSet.size) ? incl.filter(x => !isExcludedRow(x, false)) : incl;
     return { filt, incl };
   }
+  let _noCompound = false;
   async function fetchFiltered(opts){
     opts = opts || {};
     const includeBatal = !!opts.includeBatal;
@@ -1164,8 +1178,8 @@ self.onmessage = function(e){
     }
     let coll, usedCompoundSales = false, usedCompoundPay = false;
     const safe = (fn) => { try { return fn(); } catch(e){ return null; } };
-    if (filters.month && filters.sales) { coll = safe(() => db.tx.where('[bulan+sales]').equals([filters.month, filters.sales])); usedCompoundSales = !!coll; }
-    else if (filters.month && filters.payment) { coll = safe(() => db.tx.where('[bulan+pembayaran]').equals([filters.month, filters.payment])); usedCompoundPay = !!coll; }
+    if (filters.month && filters.sales && !_noCompound) { coll = safe(() => db.tx.where('[bulan+sales]').equals([filters.month, filters.sales])); usedCompoundSales = !!coll; }
+    else if (filters.month && filters.payment && !_noCompound) { coll = safe(() => db.tx.where('[bulan+pembayaran]').equals([filters.month, filters.payment])); usedCompoundPay = !!coll; }
     if (!coll && filters.month) coll = safe(() => db.tx.where('bulan').equals(filters.month));
     if (!coll && filters.sales && !filters.month) coll = safe(() => db.tx.where('sales').equals(filters.sales));
     if (!coll && filters.payment && !filters.month && !filters.sales) coll = safe(() => db.tx.where('pembayaran').equals(filters.payment));
@@ -1181,7 +1195,11 @@ self.onmessage = function(e){
       if (!includeBatal && isExcludedRow(r, false)) return false;
       return true;
     });
-    return await coll.toArray();
+    try { return await coll.toArray(); }
+    catch(eq){
+      if (!_noCompound && /not indexed|SchemaError/i.test(String(eq && (eq.name + ' ' + eq.message)))) { _noCompound = true; return await fetchFiltered(opts); }
+      throw eq;
+    }
   }
   function onProductQuickChange(){
     const q = document.getElementById('filterProductQuick'), p = document.getElementById('filterProduct');
