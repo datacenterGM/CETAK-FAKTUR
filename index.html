@@ -49,7 +49,7 @@ body{font-family:Arial;margin:0;background:var(--bg);color:var(--text)}
 header{background:#305496;color:#fff;padding:1px 14px}
 body.dark header{background:var(--body-dark-header)}
 .wrap{max-width:1600px;margin:auto;padding-top:0}
-.header-row{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.header-row{display:flex;align-items:center;justify-content:flex-start;flex-wrap:wrap;gap:10px;min-height:36px}
 .header-left{flex:1;display:flex;align-items:center;min-height:36px}
 .card{background:var(--card);margin:14px 0;padding:14px;border-radius:10px;box-shadow:var(--card-shadow)}
 button{padding:9px 14px;border:0;border-radius:7px;background:#1f4e78;color:#fff;font-weight:bold;cursor:pointer}
@@ -442,12 +442,11 @@ body.dark .pager-btn:hover:not(:disabled){background:#475569;color:#fff}
 <body>
 <header>
   <div class="wrap header-row">
-    <div class="header-left"><div class="header-title">Faktur &amp; Rekap Penjualan</div></div>
     <button type="button" id="installBtn" style="display:none;padding:3px 8px;border:1px solid rgba(255,255,255,.5);border-radius:5px;background:rgba(255,255,255,.12);color:#fff;font-size:11px;font-weight:700;cursor:pointer;white-space:nowrap;line-height:1.1">⬇ Instal Aplikasi</button>
-    <div style="display:flex;align-items:center;gap:10px">
+    <div style="display:flex;align-items:center;gap:10px;flex:1;min-width:0">
       <button type="button" class="theme-btn active" id="rekapHeaderBtn" onclick="fkInBack()" title="Rekap penjualan">📊 REKAP PENJUALAN</button>
       <button type="button" class="theme-btn" id="fkInHeaderBtn" onclick="fkInGo()" title="Input faktur penjualan baru">🧾 INPUT FAKTUR</button>
-      <button type="button" class="theme-btn" id="themeBtn" onclick="toggleTheme()" title="Mode gelap / terang">🌙</button>
+      <button type="button" class="theme-btn" id="themeBtn" style="margin-left:auto" onclick="toggleTheme()" title="Mode gelap / terang">🌙</button>
       <div class="dd" id="menuDd">
         <button type="button" class="dd-toggle" onclick="toggleDd()"><span>☰ MENU</span><span class="chev">▼</span></button>
         <div class="dd-backdrop" onclick="closeDd()"></div>
@@ -3150,6 +3149,10 @@ self.onmessage = function(e){
   let sbDirty = new Set(), sbDirtyMeta = new Set();
   try { sbDirty = new Set(JSON.parse(localStorage.getItem('sb-dirty') || '[]')); sbDirtyMeta = new Set(JSON.parse(localStorage.getItem('sb-dirty-meta') || '[]')); } catch(e){}
   const sbFk = v => String(v == null ? '' : v).trim();
+  /* Catatan versi (updated_at) tiap faktur yang sudah ada di perangkat ini, supaya kiriman sendiri tidak ditarik & diproses ulang. */
+  let sbSeen = null;
+  async function sbLoadSeen(){ if (sbSeen) return; try { const m = await db.meta.get('sbSeen'); sbSeen = (m && m.value && typeof m.value === 'object') ? m.value : {}; } catch(e){ sbSeen = {}; } }
+  async function sbSaveSeen(){ if (!sbSeen) return; sbSuppress = true; try { await db.meta.put({ key: 'sbSeen', value: sbSeen }); } catch(e){} finally { sbSuppress = false; } }
   function sbPersistQueue(){ try { localStorage.setItem('sb-dirty', JSON.stringify([...sbDirty])); localStorage.setItem('sb-dirty-meta', JSON.stringify([...sbDirtyMeta])); } catch(e){} }
   function sbSchedule(){
     clearTimeout(sbPersistTimer); sbPersistTimer = setTimeout(sbPersistQueue, 300);
@@ -3178,8 +3181,9 @@ self.onmessage = function(e){
       await db.tx.filter(r => set.has(sbFk(r.faktur))).each(r => { const o = JSON.parse(JSON.stringify(r)); delete o.id; byF.get(sbFk(r.faktur)).push(o); });
       const payload = batch.map(f => { const lines = byF.get(f); return { faktur: f, bulan: lines.length ? (lines[0].bulan || '') : null, data: lines, deleted: !lines.length }; });
       for (let i = 0; i < payload.length; i += 100) {
-        const { error } = await sbc.from('fakturs').upsert(payload.slice(i, i + 100), { onConflict: 'faktur' });
+        const { data: up, error } = await sbc.from('fakturs').upsert(payload.slice(i, i + 100), { onConflict: 'faktur' }).select('faktur,updated_at');
         if (error) throw error;
+        (up || []).forEach(u => { sbSeen[u.faktur] = u.updated_at; });
       }
     } catch(e){ batch.forEach(f => sbDirty.add(f)); sbPersistQueue(); throw e; }
     return batch.length;
@@ -3202,7 +3206,7 @@ self.onmessage = function(e){
     return o;
   }
   async function sbApply(items){
-    items = items.filter(it => !sbDirty.has(it.faktur)); if (!items.length) return 0;
+    items = items.filter(it => !sbDirty.has(it.faktur) && sbSeen[it.faktur] !== it.updated_at); if (!items.length) return 0;
     const set = new Set(items.map(i => i.faktur)), add = [];
     items.forEach(it => { if (!it.deleted && Array.isArray(it.data)) it.data.forEach(r => add.push(sbRevive(r))); });
     sbSuppress = true;
@@ -3219,6 +3223,7 @@ self.onmessage = function(e){
         await merge('products', [...products], (a, b) => a.localeCompare(b, 'id'));
       }
     } finally { sbSuppress = false; }
+    items.forEach(it => { sbSeen[it.faktur] = it.updated_at; });
     try {
       items.forEach(it => {
         if (it.deleted) { _fkRef.fk.delete(it.faktur); _fkRef.fkc.F.delete(it.faktur); _fkRef.fkc.R.delete(it.faktur); }
@@ -3276,6 +3281,7 @@ self.onmessage = function(e){
     if (sbBusy) { sbAgain = true; return; }
     sbBusy = true; sbSetStatus('☁️ Menyinkronkan…');
     try {
+      await sbLoadSeen();
       const hadRows = (await db.tx.count()) > 0;
       let pulled = 0;
       if (!localStorage.getItem('sb-init-done')) {
@@ -3292,6 +3298,7 @@ self.onmessage = function(e){
       pulled += await sbPullFakturs(false) + await sbPullSettings();
       await sbPushMeta();
       if (pulled > 0) await sbReloadUI(hadRows);
+      await sbSaveSeen();
       localStorage.setItem('sb-last-sync', new Date().toISOString());
       sbSetStatus('☁️ Tersinkron ' + new Date().toLocaleTimeString('id-ID') + (sent ? ' • terkirim ' + sent : '') + (pulled ? ' • diterima ' + pulled : ''));
     } catch(e){
