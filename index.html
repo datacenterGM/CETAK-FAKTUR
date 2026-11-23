@@ -437,6 +437,16 @@ body.dark .pager-btn{background:#334155;color:#cbd5e1}
 body.dark .pager-btn:hover:not(:disabled){background:#475569;color:#fff}
 .pager-btn:disabled{opacity:.45;cursor:not-allowed}
 .pager-bar b{color:var(--strong);font-weight:700}
+/* ===== TAB TAGIHAN & UANG MASUK (memuat tagihan.html) ===== */
+#page-tagihan{display:none}
+body.tg-mode #page-penjualan{display:none}
+body.tg-mode #page-tagihan{display:block}
+.tg-bar{display:flex;flex-wrap:wrap;gap:6px;padding:6px 0}
+.tg-btn{background:var(--card);border:1px solid var(--border);color:var(--text);font-size:12px;font-weight:700;padding:6px 10px;border-radius:6px;cursor:pointer;line-height:1.1}
+.tg-btn:hover{background:var(--hover-bg)}
+.tg-btn.active{background:var(--chip-active-bg);border-color:var(--chip-active-bg);color:var(--chip-active-text)}
+.tg-btn .tab-n{font-size:11px;opacity:.85}
+#tgFrame{width:100%;border:0;display:block;min-height:420px;background:var(--bg)}
 </style>
 </head>
 <body>
@@ -446,6 +456,7 @@ body.dark .pager-btn:hover:not(:disabled){background:#475569;color:#fff}
     <div style="display:flex;align-items:center;gap:10px;flex:1;min-width:0">
       <button type="button" class="theme-btn active" id="rekapHeaderBtn" onclick="fkInBack()" title="Rekap penjualan">📊 REKAP PENJUALAN</button>
       <button type="button" class="theme-btn" id="fkInHeaderBtn" onclick="fkInGo()" title="Input faktur penjualan baru">🧾 INPUT FAKTUR</button>
+      <button type="button" class="theme-btn" id="tgHeaderBtn" onclick="tgGo()" title="Tagihan tempo/cash, uang masuk, cek titip">📋 TAGIHAN</button>
       <button type="button" class="theme-btn" id="themeBtn" style="margin-left:auto" onclick="toggleTheme()" title="Mode gelap / terang">🌙</button>
       <div class="dd" id="menuDd">
         <button type="button" class="dd-toggle" onclick="toggleDd()"><span>☰ MENU</span><span class="chev">▼</span></button>
@@ -615,6 +626,17 @@ body.dark .pager-btn:hover:not(:disabled){background:#475569;color:#fff}
 </div>
       </div>
     </div>
+  </div>
+  <div id="page-tagihan">
+    <div class="tg-bar" id="tgBar">
+      <button type="button" class="tg-btn" data-k="tempo">📋 Tagihan Tempo <span class="tab-n"></span></button>
+      <button type="button" class="tg-btn" data-k="cash">📋 Tagihan Cash <span class="tab-n"></span></button>
+      <button type="button" class="tg-btn" data-k="um">💰 Uang Masuk <span class="tab-n"></span></button>
+      <button type="button" class="tg-btn" data-k="titip">📌 Cek Titip <span class="tab-n"></span></button>
+      <button type="button" class="tg-btn" data-k="data">Data Penjualan <span class="tab-n"></span></button>
+      <button type="button" class="tg-btn" data-k="batal">⚠ Pelacak Batal <span class="tab-n"></span></button>
+    </div>
+    <iframe id="tgFrame" title="Tagihan dan Uang Masuk"></iframe>
   </div>
 </main>
 
@@ -1780,6 +1802,7 @@ self.onmessage = function(e){
   let _activeTab = 's6';
   function show(t, b){
     _activeTab = t;
+    if (window.tgLeave) tgLeave();
     document.body.classList.toggle('fkin-mode', t === 's15');
     const hi = document.getElementById('fkInHeaderBtn'), hr = document.getElementById('rekapHeaderBtn');
     if (hi) hi.classList.toggle('active', t === 's15'); if (hr) hr.classList.toggle('active', t !== 's15');
@@ -3132,6 +3155,7 @@ self.onmessage = function(e){
     const btn = document.getElementById('themeBtn'); if (btn) btn.textContent = dark ? '☀️' : '🌙';
     const meta = document.querySelector('meta[name="theme-color"]'); if (meta) meta.setAttribute('content', dark ? '#1e3a5f' : '#1f4e78');
     try { localStorage.setItem('rekap-theme', dark ? 'dark' : 'light'); } catch(e){}
+    try { if (window.tgSyncTheme) tgSyncTheme(dark); } catch(e){}
   }
   function toggleTheme(){ applyTheme(document.body.classList.contains('dark') ? 'light' : 'dark'); }
   function initTheme(){
@@ -3391,5 +3415,56 @@ self.onmessage = function(e){
   window.addEventListener('appinstalled', () => { const btn = document.getElementById('installBtn'); if (btn) btn.style.display = 'none'; });
 </script>
 <script type="module" src="https://static.cloudflareinsights.com/beacon.min.js/vce701823e78c4301a35b7e07294d87301792088814092" integrity="sha512-UKNk8GbxkABxKcXYuLkO16EleLGUkcvJWtpSNmExE0Too3ZaFAxTscNWEc1OdAv5/BikHawapSCaiD2XCmp+Bw==" data-cf-beacon='{"version":"2024.11.0","token":"4edd5f8ec12a48cfa682ab8261b80a79","spa":2}' crossorigin="anonymous"></script>
+<script>
+/* ===== Tab Tagihan & Uang Masuk: memuat tagihan.html di dalam halaman ini ===== */
+(function(){
+  var KEYS={tempo:'#tgTabBtn',cash:'#tgTabBtnC',um:'#umTabBtn',titip:'#ttTabBtn',data:'.tab[data-tab="lengkap"]',batal:'.tab[data-tab="batal"]'};
+  var BADGE={tempo:'tgN',cash:'tgNC',um:'umN',titip:'ttN',batal:'batalN'};
+  var loaded=false;
+  function fr(){ return document.getElementById('tgFrame'); }
+  function doc(){ try{ return fr().contentDocument; }catch(e){ return null; } }
+  function sizeFrame(){
+    var f=fr(); if(!f||!document.body.classList.contains('tg-mode')) return;
+    var t=f.getBoundingClientRect().top;
+    f.style.height=Math.max(420, window.innerHeight - t - 6)+'px';
+  }
+  function syncBar(){
+    var d=doc(); if(!d) return;
+    Object.keys(KEYS).forEach(function(k){
+      var el=d.querySelector(KEYS[k]), b=document.querySelector('#tgBar [data-k="'+k+'"]'); if(!b) return;
+      b.classList.toggle('active', !!(el && el.classList.contains('active')));
+      var n=BADGE[k] && d.getElementById(BADGE[k]), s=b.querySelector('.tab-n');
+      if(s) s.textContent = n ? n.textContent : '';
+    });
+  }
+  function onLoad(){
+    var d=doc(); if(!d) return;
+    window.tgSyncTheme(document.body.classList.contains('dark'));
+    try{ new MutationObserver(syncBar).observe(d.getElementById('tabs'),{subtree:true,childList:true,characterData:true,attributes:true,attributeFilter:['class']}); }catch(e){}
+    syncBar(); sizeFrame();
+  }
+  window.tgSyncTheme=function(dark){
+    try{ var w=fr() && fr().contentWindow; if(w && w.PJTheme) w.PJTheme.set(dark?'dark':'light'); }catch(e){}
+  };
+  window.tgGo=function(){
+    if(!loaded){ loaded=true; fr().addEventListener('load', onLoad); fr().src='tagihan.html'; }
+    document.body.classList.remove('fkin-mode');
+    document.body.classList.add('tg-mode');
+    ['rekapHeaderBtn','fkInHeaderBtn'].forEach(function(id){ var e=document.getElementById(id); if(e) e.classList.remove('active'); });
+    document.getElementById('tgHeaderBtn').classList.add('active');
+    window.scrollTo(0,0); sizeFrame(); setTimeout(sizeFrame,60);
+  };
+  window.tgLeave=function(){
+    document.body.classList.remove('tg-mode');
+    var e=document.getElementById('tgHeaderBtn'); if(e) e.classList.remove('active');
+  };
+  document.getElementById('tgBar').addEventListener('click', function(ev){
+    var b=ev.target.closest('[data-k]'), d=doc(); if(!b||!d) return;
+    var el=d.querySelector(KEYS[b.dataset.k]); if(el) el.click();
+    syncBar();
+  });
+  window.addEventListener('resize', sizeFrame);
+})();
+</script>
 </body>
 </html>
